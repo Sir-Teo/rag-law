@@ -86,7 +86,7 @@ def generate_and_rerank(prompt, tokenizer, llm, sampling_params, cross_encoder, 
         add_generation_prompt=True,
     )
     
-    # Replicate the prompt to generate multiple candidate answers
+    # Replicate the prompt to generate multiple  answers
     prompts = [formatted_prompt] * num_candidates
     outputs = llm.generate(prompts, sampling_params)
     
