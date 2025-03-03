@@ -5,21 +5,22 @@ main.py
 A robust retrieval-augmented generation (RAG) pipeline that:
 1. Reads partitions from a JSON file.
 2. Builds a FAISS index using embeddings.
-3. Retrieves context based on a user query.
-4. Optionally reranks context based on a user query if --rerank is enabled.
-5. Generates multiple candidate summaries using Qwen via vllm (following its official prompting style).
+3. Retrieves context based on a retrieval query.
+4. Optionally reranks context based on the retrieval query if --rerank is enabled.
+5. Generates multiple candidate summaries using Qwen via vllm (following its official prompting style) with a generation query.
 6. Optionally uses a cross-encoder to select the best answer if --rerank is enabled.
+7. Runs four fixed queries and saves each generated output in a txt file, including a section that lists the reranked partition section names and scores.
 
 Usage:
-    python main.py --file_path <path_to_json> --query "Your query here" [--top_k 5] [--model_name Qwen/Qwen2.5-7B-Instruct-1M] [--rerank]
+    python main.py --file_path <path_to_json> [--top_k 100] [--model_name Qwen/Qwen2.5-7B-Instruct-1M] [--rerank]
+    
+The four queries are:
+    A. "Golden parachute"
+    B. "Conflicts of interest related to the transaction"
+    C. "Litigation related to the transaction"
+    D. "Background of the transaction"
 """
 import os
-
-# Set the XDG_CONFIG_HOME to a local directory (e.g., "./.config")
-local_config = os.path.join(os.getcwd(), ".config")
-os.makedirs(local_config, exist_ok=True)
-os.environ["XDG_CONFIG_HOME"] = local_config
-
 import json
 import argparse
 import logging
@@ -29,6 +30,11 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 import faiss
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+
+# Set the XDG_CONFIG_HOME to a local directory (e.g., "./.config")
+local_config = os.path.join(os.getcwd(), ".config")
+os.makedirs(local_config, exist_ok=True)
+os.environ["XDG_CONFIG_HOME"] = local_config
 
 def read_partitions(file_path):
     try:
@@ -60,6 +66,12 @@ def retrieve_context(query_embedding, index, partitions, top_k):
     return retrieved_partitions
 
 def rerank_partitions(query, partitions, cross_encoder, top_k):
+    """
+    Rerank partitions using a cross-encoder.
+    Returns:
+        top_partitions: list of top partitions (up to top_k)
+        ranked: full ranking list as tuples (partition, score)
+    """
     # Prepare input pairs: (query, partition text)
     encoder_inputs = [(query, part['text']) for part in partitions]
     scores = cross_encoder.predict(encoder_inputs)
@@ -70,7 +82,7 @@ def rerank_partitions(query, partitions, cross_encoder, top_k):
         logging.info("Partition %d: Score = %.4f, Titles = %s", idx, score, section_names)
     top_partitions = [part for part, _ in ranked[:top_k]]
     logging.info("Selected top %d partitions after reranking.", len(top_partitions))
-    return top_partitions
+    return top_partitions, ranked
 
 def generate_and_rerank(prompt, tokenizer, llm, sampling_params, cross_encoder, num_candidates=5):
     # Create messages using Qwen's expected chat format
@@ -86,7 +98,7 @@ def generate_and_rerank(prompt, tokenizer, llm, sampling_params, cross_encoder, 
         add_generation_prompt=True,
     )
     
-    # Replicate the prompt to generate multiple  answers
+    # Replicate the prompt to generate multiple answers
     prompts = [formatted_prompt] * num_candidates
     outputs = llm.generate(prompts, sampling_params)
     
@@ -131,10 +143,11 @@ def generate_without_rerank(prompt, tokenizer, llm, sampling_params):
 def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    parser = argparse.ArgumentParser(description="Retrieval-Augmented Generation Pipeline with vllm-based Qwen Inference")
-    parser.add_argument("--file_path", default='data/example_data.json', help="Path to the JSON file containing partitions.")
-    parser.add_argument("--query", default='', help="A summary of the nature of the transaction at issue in this document.")
-    parser.add_argument("--top_k", type=int, default=50, help="Number of partitions to retrieve and rerank.")
+    parser = argparse.ArgumentParser(
+        description="Retrieval-Augmented Generation Pipeline with vllm-based Qwen Inference for multiple queries"
+    )
+    parser.add_argument("--file_path", default='data/example_sec.json', help="Path to the JSON file containing partitions.")
+    parser.add_argument("--top_k", type=int, default=100, help="Number of partitions to retrieve and rerank.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct-1M",
                         help="Name of the generative model to use (for Qwen, use Qwen/Qwen2.5-7B-Instruct-1M).")
     parser.add_argument("--rerank", action='store_true', help="Enable reranking steps for both partitions and candidate answers.")
@@ -154,13 +167,8 @@ def main():
     # Build FAISS index for retrieval
     index = build_faiss_index(embeddings)
     
-    # Compute query embedding and retrieve relevant partitions
-    logging.info("Computing embedding for the query...")
-    query_embedding = embedder.encode(args.query, convert_to_numpy=True)
-    logging.info("Retrieving top %d partitions relevant to the query...", args.top_k)
-    retrieved_partitions = retrieve_context(query_embedding, index, partitions, args.top_k)
-    
-    # Load cross-encoder for reranking (if rerank flag is enabled)
+    # If reranking is enabled, load cross-encoder (used for both partition and candidate reranking)
+    cross_encoder = None
     if args.rerank:
         logging.info("Loading cross-encoder for reranking...")
         try:
@@ -168,29 +176,6 @@ def main():
         except Exception as e:
             logging.error("Error loading cross-encoder: %s", e)
             sys.exit(1)
-        logging.info("Reranking retrieved partitions based on query relevance...")
-        top_partitions = rerank_partitions(args.query, retrieved_partitions, cross_encoder, args.top_k)
-    else:
-        logging.info("Skipping partition reranking. Using raw retrieved partitions.")
-        top_partitions = retrieved_partitions
-    
-    # Log selected partition titles
-    for idx, part in enumerate(top_partitions):
-        section_names = ", ".join(part['titles']) if part['titles'] else "No Title"
-        logging.info("Selected Partition %d Section Name(s): %s", idx, section_names)
-    
-    # Concatenate texts from top partitions to form the refined context
-    context = "\n\n".join([part['text'] for part in top_partitions])
-    logging.info("Constructed refined context from top partitions.")
-    
-    # Optimized prompt: combine context with a clear task instruction
-    optimized_prompt = (
-        f"Below is context extracted from a document regarding an M&A transaction:\n\n{context}\n\n"
-        "Please provide a concise and clear summary highlighting the key aspects of the transaction, including involved parties, "
-        "basic deal terms, transaction structure, timeline, sales process details, board decisions, financial advisor roles, "
-        "governance mechanisms, and any potential conflicts. Ensure the summary is well-structured and informative."
-    )
-    logging.info("Constructed optimized prompt for generation.")
     
     # Load tokenizer and initialize vllm generative model
     logging.info("Loading tokenizer for generative model: %s", args.model_name)
@@ -209,17 +194,78 @@ def main():
     # Set sampling parameters for generation (these mirror Qwen's defaults)
     sampling_params = SamplingParams(temperature=0.7, top_p=0.8, repetition_penalty=1.05, max_tokens=512)
     
-    # Generate candidate answers and optionally rerank them using vllm and cross-encoder
-    if args.rerank:
-        logging.info("Generating and reranking candidate answers using vllm...")
-        final_answer = generate_and_rerank(optimized_prompt, tokenizer, llm, sampling_params, cross_encoder, num_candidates=5)
-    else:
-        logging.info("Generating candidate answer without reranking...")
-        final_answer = generate_without_rerank(optimized_prompt, tokenizer, llm, sampling_params)
+    # Define the fixed queries to run, along with a label for the output file.
+    queries = [
+        ("A", "Golden parachute"),
+        ("B", "Conflicts of interest related to the transaction"),
+        ("C", "Litigation related to the transaction"),
+        ("D", "Background of the transaction"),
+    ]
     
-    # Output the final answer
-    print("=== Answer ===")
-    print(final_answer)
+    # Loop through each query, run the retrieval-augmented generation pipeline, and save the output.
+    for label, query_text in queries:
+        logging.info("Processing query %s: %s", label, query_text)
+        # Compute embedding for the current query (using the query text for retrieval)
+        retrieval_query_embedding = embedder.encode(query_text, convert_to_numpy=True)
+        logging.info("Retrieving top %d partitions relevant to the query...", args.top_k)
+        retrieved_partitions = retrieve_context(retrieval_query_embedding, index, partitions, args.top_k)
+    
+        # Rerank partitions if enabled; otherwise, use the raw retrieved partitions.
+        reranked_details = None
+        if args.rerank:
+            logging.info("Reranking retrieved partitions for query: %s", query_text)
+            top_partitions, reranked_details = rerank_partitions(query_text, retrieved_partitions, cross_encoder, args.top_k)
+        else:
+            logging.info("Skipping partition reranking for query: %s. Using raw retrieved partitions.", query_text)
+            top_partitions = retrieved_partitions
+    
+        # Log selected partition titles
+        for idx, part in enumerate(top_partitions):
+            section_names = ", ".join(part['titles']) if part['titles'] else "No Title"
+            logging.info("Selected Partition %d Section Name(s): %s", idx, section_names)
+    
+        # Concatenate texts from top partitions to form the refined context
+        context = "\n\n".join([part['text'] for part in top_partitions])
+        logging.info("Constructed refined context from top partitions.")
+    
+        # Construct an optimized prompt using the current query.
+        optimized_prompt = (
+            f"Below is context extracted from a document regarding {query_text}:\n\n{context}\n\n"
+            f"Please extract important information about {query_text}."
+        )
+    
+        logging.info("Constructed optimized prompt for query %s.", label)
+    
+        # Generate candidate answers and optionally rerank them using vllm and cross-encoder
+        if args.rerank:
+            logging.info("Generating and reranking candidate answers for query %s using vllm...", label)
+            final_answer = generate_and_rerank(optimized_prompt, tokenizer, llm, sampling_params, cross_encoder, num_candidates=5)
+        else:
+            logging.info("Generating candidate answer for query %s without reranking...", label)
+            final_answer = generate_without_rerank(optimized_prompt, tokenizer, llm, sampling_params)
+    
+        # Prepare the output text.
+        output_text = f"=== Answer for Query {label} ({query_text}) ===\n\n{final_answer}\n"
+    
+        # If reranking is enabled, add a separate section with the reranked partition details.
+        if reranked_details is not None:
+            output_text += "\n=== Reranked Partitions and Scores ===\n"
+            for idx, (part, score) in enumerate(reranked_details):
+                section_names = ", ".join(part['titles']) if part['titles'] else "No Title"
+                output_text += f"Rank {idx+1}: {section_names} | Score: {score:.4f}\n"
+    
+        # Save the final answer (and reranking details) to a text file named output_<label>.txt
+        output_filename = f"output_{label}.txt"
+        try:
+            with open(output_filename, "w", encoding="utf-8") as outfile:
+                outfile.write(output_text)
+            logging.info("Saved generated output for query %s to %s", label, output_filename)
+        except Exception as e:
+            logging.error("Error writing output for query %s: %s", label, e)
+    
+        # Optionally, also print the answer to stdout
+        print(output_text)
+        print("\n" + "="*40 + "\n")
 
 if __name__ == "__main__":
     main()
