@@ -1,19 +1,22 @@
 #!/usr/bin/env python
+
 """
 main.py
 
-A robust retrieval-augmented retrieval pipeline wrapped in a class named LLMExtractor.
+A robust retrieval-augmented retrieval pipeline wrapped in a class named RerankExtractor.
+Reranking is always enabled by default (no property or toggle for disabling it).
+
 This class:
   1. Reads partitions from a JSON file.
-  2. Builds a FAISS index using embeddings.
+  2. Builds a FAISS index using embeddings (default model is all-MiniLM-L6-v2, can be overridden by --model_name).
   3. Retrieves context based on a retrieval query.
-  4. Optionally reranks context based on the retrieval query if rerank is enabled.
+  4. Reranks the retrieved context based on the retrieval query using a cross-encoder (always uses cross-encoder/ms-marco-MiniLM-L-12-v2).
   5. Returns the concatenated retrieved context as the answer.
   6. Reports section scores for each partition.
   7. Runs fixed queries and saves each output in a text file.
      
 Usage:
-    python main.py --file_path <path_to_json> [--top_k 100] [--rerank]
+    python main.py --file_path <path_to_json> [--top_k 100] [--model_name <model_name>] [--api_key <api_key>]
 """
 
 import os
@@ -30,29 +33,43 @@ local_config = os.path.join(os.getcwd(), ".config")
 os.makedirs(local_config, exist_ok=True)
 os.environ["XDG_CONFIG_HOME"] = local_config
 
+class RerankExtractor:
+    def __init__(self, file_path, top_k=100, model_name=None, api_key=None):
+        """
+        Initialize the RerankExtractor.
 
-class LLMExtractor:
-    def __init__(self, file_path, top_k=100, rerank=False):
+        Args:
+            file_path (str): Path to the JSON file with partitions.
+            top_k (int, optional): Number of partitions to retrieve. Defaults to 100.
+            model_name (str, optional): Model name for the embedding model. Defaults to 'all-MiniLM-L6-v2'.
+            api_key (str, optional): API key for any external service (if needed). Defaults to None.
+        """
         self.file_path = file_path
         self.top_k = top_k
-        self.rerank = rerank
+        self.model_name = model_name if model_name else "all-MiniLM-L6-v2"
+        self.api_key = api_key
         self.partitions = None
         self.index = None
 
-        # Load embedding model (for both partitions and queries)
-        logging.info("Loading embedding model...")
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        # Log model_name and api_key if provided
+        logging.info(f"Embedding model set to: {self.model_name}")
+        logging.info(f"API key provided: {'Yes' if self.api_key else 'No'}")
 
-        # Load cross-encoder for reranking if enabled
-        if self.rerank:
-            logging.info("Loading cross-encoder for reranking...")
-            try:
-                self.cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2")
-            except Exception as e:
-                logging.error("Error loading cross-encoder: %s", e)
-                sys.exit(1)
-        else:
-            self.cross_encoder = None
+        # Load embedding model (for partitions and queries) using model_name
+        logging.info("Loading embedding model...")
+        try:
+            self.embedder = SentenceTransformer(self.model_name)
+        except Exception as e:
+            logging.error("Error loading embedding model '%s': %s", self.model_name, e)
+            sys.exit(1)
+
+        # Load cross-encoder for reranking (fixed model)
+        logging.info("Loading cross-encoder (cross-encoder/ms-marco-MiniLM-L-12-v2) for reranking...")
+        try:
+            self.cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2")
+        except Exception as e:
+            logging.error("Error loading cross-encoder: %s", e)
+            sys.exit(1)
 
     def _load_partitions(self):
         try:
@@ -124,15 +141,10 @@ class LLMExtractor:
         logging.info("Retrieving top %d partitions relevant to the query...", self.top_k)
         retrieved_partitions, faiss_scores, _ = self._retrieve_context(retrieval_query_embedding)
 
-        if self.rerank:
-            logging.info("Reranking retrieved partitions for query: %s", query_text)
-            top_partitions, reranked_details = self._rerank_partitions(query_text, retrieved_partitions)
-            score_header = "Reranked Partitions and Cross-Encoder Scores"
-        else:
-            logging.info("Using raw retrieved partitions with FAISS scores for query: %s", query_text)
-            top_partitions = retrieved_partitions
-            reranked_details = list(zip(retrieved_partitions, faiss_scores))
-            score_header = "Retrieved Partitions and FAISS Scores"
+        # Always rerank the retrieved partitions
+        logging.info("Reranking retrieved partitions for query: %s", query_text)
+        top_partitions, reranked_details = self._rerank_partitions(query_text, retrieved_partitions)
+        score_header = "Reranked Partitions and Cross-Encoder Scores"
 
         for idx, part in enumerate(top_partitions):
             section_names = ", ".join(part['titles']) if part['titles'] else "No Title"
@@ -187,17 +199,22 @@ class LLMExtractor:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     parser = argparse.ArgumentParser(
-        description="Retrieval-Augmented Pipeline using LLMExtractor."
+        description="Rerank Pipeline using RerankExtractor."
     )
     parser.add_argument("--file_path", default='data/example_sec.json', help="Path to the JSON file containing partitions.")
     parser.add_argument("--top_k", type=int, default=100, help="Number of partitions to retrieve and rerank.")
-    parser.add_argument("--rerank", action='store_true', help="Enable reranking steps for partitions.")
+    parser.add_argument("--model_name", type=str, default=None, help="Name of the model to use for the embedding model. Defaults to all-MiniLM-L6-v2.")
+    parser.add_argument("--api_key", type=str, default=None, help="API key if needed for external services.")
     args = parser.parse_args()
 
-    extractor = LLMExtractor(
+    extractor = RerankExtractor(
         file_path=args.file_path,
         top_k=args.top_k,
-        rerank=args.rerank
+        model_name=args.model_name,
+        api_key=args.api_key
     )
     extractor.setup_pipeline()
     extractor.run_pipeline()
+
+
+
